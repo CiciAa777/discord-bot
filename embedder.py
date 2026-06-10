@@ -1,6 +1,5 @@
 import chromadb
-from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
-from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core import Settings
 from llama_index.embeddings.openai_like import OpenAILikeEmbedding
 from config import CHROMA_PERSIST_DIR, CHROMA_COLLECTION, UCSD_API_KEY, UCSD_BASE_URL, LLM_EMBED_MODEL
 
@@ -17,68 +16,80 @@ _collection = _chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"}
 )
 
-# Lower this if consolidation isn't triggering — 0.80 catches near-duplicates and typos
+# Similarity band for consolidation:
+#   >= SKIP_THRESHOLD  → so similar that llm_compare is skipped; treat as duplicate outright
+#   >= CONSOLIDATION_THRESHOLD (and < SKIP_THRESHOLD) → ask LLM to compare
+#   <  CONSOLIDATION_THRESHOLD → no overlap, save immediately without any LLM call
 CONSOLIDATION_THRESHOLD = 0.80
-
-
-def _get_index() -> VectorStoreIndex:
-    vector_store = ChromaVectorStore(chroma_collection=_collection)
-    storage_ctx = StorageContext.from_defaults(vector_store=vector_store)
-    return VectorStoreIndex([], storage_context=storage_ctx)
-
-
-def upsert(note_id: int, user_id: str, text: str):
-    """Embed and store a Note in ChromaDB."""
-    doc = Document(
-        text=text,
-        doc_id=str(note_id),
-        metadata={"user_id": user_id, "note_id": note_id}
-    )
-    index = _get_index()
-    index.insert(doc)
+SKIP_LLM_THRESHOLD = 0.97   # near-identical text; no point asking the LLM
 
 
 def _embed(text: str) -> list[float]:
     return Settings.embed_model.get_text_embedding(text)
 
 
-def find_similar(user_id: str, text: str, top_k: int = 1) -> list[dict]:
+def upsert(note_id: int, user_id: str, text: str, embedding: list[float] | None = None):
     """
-    Return up to top_k notes for this user with cosine similarity above threshold.
-    Each result: {"note_id": int, "score": float}
-    ChromaDB cosine distance is in [0, 2]; similarity = 1 - distance.
+    Store a note in ChromaDB.
+    Pass `embedding` to reuse a vector already computed during find_similar_for_save,
+    saving a second round-trip to the embedding API.
+    """
+    vec = embedding if embedding is not None else _embed(text)
+    _collection.upsert(
+        ids=[str(note_id)],
+        embeddings=[vec],
+        documents=[text],
+        metadatas=[{"user_id": user_id, "note_id": note_id}]
+    )
+
+
+def find_similar_for_save(user_id: str, text: str) -> tuple[list[dict], list[float]]:
+    """
+    Returns (matches, embedding) so the caller can reuse the embedding in upsert()
+    without a second API call.
+
+    matches: list of {"note_id": int, "score": float, "skip_llm": bool}
+      skip_llm=True means similarity is so high llm_compare can be bypassed.
     """
     try:
         query_embedding = _embed(text)
-        # Need at least 1 result; guard against empty collection
         count = _collection.count()
         if count == 0:
-            return []
-        n = min(top_k + 5, count)
+            return [], query_embedding
+        n = min(6, count)
         results = _collection.query(
             query_embeddings=[query_embedding],
             n_results=n,
             include=["metadatas", "distances"]
         )
     except Exception as e:
-        print(f"[embedder.find_similar] error: {e}")
-        return []
+        print(f"[embedder.find_similar_for_save] error: {e}")
+        return [], []
 
     matches = []
     if not results["ids"] or not results["ids"][0]:
-        return matches
+        return matches, query_embedding
 
     for meta, distance in zip(results["metadatas"][0], results["distances"][0]):
         if meta.get("user_id") != user_id:
             continue
-        similarity = 1 - distance   # cosine: 0=identical, 1=orthogonal
+        similarity = 1 - distance
         print(f"[consolidation] note={meta['note_id']} similarity={similarity:.4f}")
         if similarity >= CONSOLIDATION_THRESHOLD:
-            matches.append({"note_id": int(meta["note_id"]), "score": round(similarity, 4)})
-        if len(matches) >= top_k:
-            break
+            matches.append({
+                "note_id": int(meta["note_id"]),
+                "score": round(similarity, 4),
+                "skip_llm": similarity >= SKIP_LLM_THRESHOLD,
+            })
+            break   # only need the closest match
 
-    return matches
+    return matches, query_embedding
+
+
+# Keep the old find_similar for any callers outside the save path
+def find_similar(user_id: str, text: str, top_k: int = 1) -> list[dict]:
+    matches, _ = find_similar_for_save(user_id, text)
+    return [{"note_id": m["note_id"], "score": m["score"]} for m in matches[:top_k]]
 
 
 def delete(note_id: int):

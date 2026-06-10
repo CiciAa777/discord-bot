@@ -216,16 +216,23 @@ async def _save_with_consolidation_check(
     discord_message_id: str = None,
     original_message: discord.Message = None,
 ):
-    # FIX: find_similar_note does a ChromaDB query (sync) — run in thread
-    existing = await asyncio.to_thread(ingestion.find_similar_note, user_id, text)
+    # Single embedding round-trip: returns (existing_note | None, embedding, skip_llm)
+    # The embedding is reused by ingest_text so we never call the embedding API twice.
+    existing, embedding, skip_llm = await asyncio.to_thread(
+        ingestion.find_similar_note, user_id, text
+    )
 
     if existing:
-        # FIX: llm_compare calls OpenAI (sync) — run in thread
-        comparison = await asyncio.to_thread(
-            ingestion.llm_compare, existing["content_text"], text
-        )
-        verdict = comparison["verdict"]
-        reason = comparison["reason"]
+        if skip_llm:
+            # Near-identical (>= SKIP_LLM_THRESHOLD) — treat as duplicate without an LLM call
+            verdict, reason = "duplicate", "Notes are nearly identical."
+        else:
+            # In the 0.80–0.97 band — worth asking the LLM
+            comparison = await asyncio.to_thread(
+                ingestion.llm_compare, existing["content_text"], text
+            )
+            verdict = comparison["verdict"]
+            reason = comparison["reason"]
 
         verdict_label = {
             "duplicate": "🔁 Duplicate",
@@ -250,9 +257,9 @@ async def _save_with_consolidation_check(
         )
         return
 
-    # FIX: ingest_text does DB write + ChromaDB embed (sync) — run in thread
+    # Reuse the embedding computed above — ingest_text won't call the API again
     note = await asyncio.to_thread(
-        ingestion.ingest_text, user_id, text, discord_message_id
+        ingestion.ingest_text, user_id, text, discord_message_id, embedding
     )
 
     if note.is_sensitive:

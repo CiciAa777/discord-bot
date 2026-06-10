@@ -13,7 +13,7 @@ import extractor_ocr
 import extractor_vision
 import db
 import embedder
-from sensitive import is_sensitive   # single source of truth
+from sensitive import is_sensitive
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
@@ -52,13 +52,18 @@ def llm_compare(existing_text: str, new_text: str) -> dict:
         return {"verdict": "keep_both", "reason": "Could not compare notes."}
 
 
-def find_similar_note(user_id: str, text: str) -> dict | None:
-    """Returns the most similar existing note dict if above threshold, else None."""
-    matches = embedder.find_similar(user_id, text, top_k=1)
+def find_similar_note(user_id: str, text: str) -> tuple[dict | None, list[float], bool]:
+    """
+    Returns (existing_note_or_None, embedding, skip_llm).
+    The embedding can be reused in ingest_text to avoid a second API call.
+    skip_llm=True means the match is near-identical; llm_compare can be bypassed.
+    """
+    matches, embedding = embedder.find_similar_for_save(user_id, text)
     if not matches:
-        return None
+        return None, embedding, False
     notes = db.get_notes_by_ids([matches[0]["note_id"]])
-    return notes[0] if notes else None
+    existing = notes[0] if notes else None
+    return existing, embedding, matches[0].get("skip_llm", False)
 
 
 async def ingest_image(user_id: str, image_url: str,
@@ -103,7 +108,13 @@ async def ingest_image(user_id: str, image_url: str,
     return note
 
 
-def ingest_text(user_id: str, text: str, discord_message_id: str = None) -> Note:
+def ingest_text(user_id: str, text: str,
+                discord_message_id: str = None,
+                embedding: list[float] | None = None) -> Note:
+    """
+    Save a text note. Pass `embedding` to reuse a vector already computed
+    during find_similar_note, avoiding a redundant embedding API call.
+    """
     note = Note(
         user_id=user_id,
         content_text=text,
@@ -112,7 +123,8 @@ def ingest_text(user_id: str, text: str, discord_message_id: str = None) -> Note
         discord_message_id=discord_message_id
     )
     note.id = db.insert_note(note)
-    embedder.upsert(note.id, user_id, text)
+    # Reuse the embedding if provided — skips a second round-trip
+    embedder.upsert(note.id, user_id, text, embedding=embedding)
     return note
 
 
