@@ -22,11 +22,22 @@ Settings.embed_model = OpenAILikeEmbedding(
 _chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 _collection = _chroma_client.get_or_create_collection(CHROMA_COLLECTION)
 
+# FIX: cache the index — rebuilding VectorStoreIndex on every retrieve() call
+# was the primary source of latency/blocking for /ask. The index wraps a
+# persistent ChromaDB collection so it stays current without rebuilding.
+_index: VectorStoreIndex | None = None
+
+def _get_index() -> VectorStoreIndex:
+    global _index
+    if _index is None:
+        vector_store = ChromaVectorStore(chroma_collection=_collection)
+        storage_ctx = StorageContext.from_defaults(vector_store=vector_store)
+        _index = VectorStoreIndex([], storage_context=storage_ctx)
+    return _index
+
 
 def retrieve(query: str, user_id: str) -> list[int]:
-    vector_store = ChromaVectorStore(chroma_collection=_collection)
-    storage_ctx = StorageContext.from_defaults(vector_store=vector_store)
-    index = VectorStoreIndex([], storage_context=storage_ctx)
+    index = _get_index()
 
     retriever = index.as_retriever(
         similarity_top_k=TOP_K * 3,

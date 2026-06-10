@@ -20,6 +20,7 @@ Other:
   • !clear              — wipe thread conversation history
 """
 
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -83,7 +84,10 @@ def _classify(text: str) -> str:
         return "ignore"
 
 async def _send_query_response(channel, reply_func, thread_id: str, user_id: str, text: str):
-    reply_text, safe_notes, sensitive_notes = conversation.answer(thread_id, user_id, text)
+    # FIX: conversation.answer() calls OpenAI + ChromaDB synchronously — run in thread
+    reply_text, safe_notes, sensitive_notes = await asyncio.to_thread(
+        conversation.answer, thread_id, user_id, text
+    )
     await reply_func(reply_text)
     for n in safe_notes[:3]:
         await channel.send(embed=_make_embed(n))
@@ -118,8 +122,11 @@ class ConsolidationView(discord.ui.View):
             return
         db.delete_note(self.existing_note["id"])
         embedder.delete(self.existing_note["id"])
-        note = ingestion.ingest_text(self.user_id, self.new_text,
-                                     discord_message_id=self.discord_message_id)
+        # FIX: ingest_text is sync (DB write + embedding) — run in thread
+        note = await asyncio.to_thread(
+            ingestion.ingest_text, self.user_id, self.new_text,
+            self.discord_message_id
+        )
         self.stop()
         await interaction.response.edit_message(
             content=f"✅ Replaced Note {self.existing_note['id']} with Note {note.id}.",
@@ -131,8 +138,11 @@ class ConsolidationView(discord.ui.View):
         if str(interaction.user.id) != self.user_id:
             await interaction.response.send_message("Not your note.", ephemeral=True)
             return
-        note = ingestion.ingest_text(self.user_id, self.new_text,
-                                     discord_message_id=self.discord_message_id)
+        # FIX: same as above
+        note = await asyncio.to_thread(
+            ingestion.ingest_text, self.user_id, self.new_text,
+            self.discord_message_id
+        )
         self.stop()
         await interaction.response.edit_message(
             content=f"✅ Saved as Note {note.id}. Both notes kept.",
@@ -206,15 +216,17 @@ async def _save_with_consolidation_check(
     discord_message_id: str = None,
     original_message: discord.Message = None,
 ):
-    existing = ingestion.find_similar_note(user_id, text)
+    # FIX: find_similar_note does a ChromaDB query (sync) — run in thread
+    existing = await asyncio.to_thread(ingestion.find_similar_note, user_id, text)
 
     if existing:
-        # LLM compares the two notes and returns a verdict + reason
-        comparison = ingestion.llm_compare(existing["content_text"], text)
+        # FIX: llm_compare calls OpenAI (sync) — run in thread
+        comparison = await asyncio.to_thread(
+            ingestion.llm_compare, existing["content_text"], text
+        )
         verdict = comparison["verdict"]
         reason = comparison["reason"]
 
-        # verdict labels shown to user
         verdict_label = {
             "duplicate": "🔁 Duplicate",
             "update":    "🔄 Update to existing",
@@ -238,7 +250,10 @@ async def _save_with_consolidation_check(
         )
         return
 
-    note = ingestion.ingest_text(user_id, text, discord_message_id=discord_message_id)
+    # FIX: ingest_text does DB write + ChromaDB embed (sync) — run in thread
+    note = await asyncio.to_thread(
+        ingestion.ingest_text, user_id, text, discord_message_id
+    )
 
     if note.is_sensitive:
         await send_func(
@@ -314,8 +329,9 @@ async def on_message(message: discord.Message):
             )
         return
 
+    # FIX: _classify calls OpenAI (sync) — run in thread
     async with message.channel.typing():
-        intent = _classify(text)
+        intent = await asyncio.to_thread(_classify, text)
 
     if intent == "save":
         async def _send(content, embeds, view):
@@ -345,7 +361,8 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     existing = db.get_note_by_discord_message_id(str(after.id))
     if not existing:
         return
-    ingestion.update_note(existing["id"], new_text)
+    # FIX: update_note does DB write + re-embed (sync) — run in thread
+    await asyncio.to_thread(ingestion.update_note, existing["id"], new_text)
     await after.add_reaction("✏️")
 
 
@@ -359,7 +376,6 @@ async def on_message_delete(message: discord.Message):
         return
     db.delete_note(existing["id"])
     embedder.delete(existing["id"])
-    # Can't react to a deleted message — DM the user instead
     try:
         user = await bot.fetch_user(message.author.id)
         await user.send(
@@ -367,7 +383,7 @@ async def on_message_delete(message: discord.Message):
             "because you deleted the original Discord message."
         )
     except Exception:
-        pass  # DMs disabled or other error — fail silently
+        pass
 
 
 # ── slash commands ────────────────────────────────────────────────────────────
@@ -389,7 +405,10 @@ async def slash_ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
     uid = str(interaction.user.id)
     tid = str(interaction.channel_id)
-    reply_text, safe_notes, sensitive_notes = conversation.answer(tid, uid, question)
+    # FIX: conversation.answer() is fully synchronous — run in thread
+    reply_text, safe_notes, sensitive_notes = await asyncio.to_thread(
+        conversation.answer, tid, uid, question
+    )
     await interaction.followup.send(reply_text)
     for n in safe_notes[:3]:
         await interaction.followup.send(embed=_make_embed(n))
