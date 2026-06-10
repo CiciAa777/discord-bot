@@ -37,7 +37,7 @@ Once added, the bot is live as long as I have `bot.py` running on my machine.
 ---
 ## Demo Video
 [Discord Bot Demo](https://youtu.be/GbfL2x-EJMg)
-
+[Discord Bot New Demo](https://youtu.be/9RZWZfwJgHY)
 
 ##  System Architecture
 

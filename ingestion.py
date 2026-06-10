@@ -1,14 +1,14 @@
 """
 Ingestion pipeline for SnapVault.
 - Images: OCR → Vision fallback → save + embed
-- Text: save + embed, with LLM-powered similarity check for consolidation
+- Text: save + embed, with difflib similarity check for consolidation
 """
 import os
 import uuid
+import difflib
 import aiohttp
-import openai
 from models import Note
-from config import UPLOADS_DIR, UCSD_API_KEY, UCSD_BASE_URL, LLM_CHAT_MODEL
+from config import UPLOADS_DIR
 import extractor_ocr
 import extractor_vision
 import db
@@ -17,53 +17,27 @@ from sensitive import is_sensitive
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-_llm = openai.OpenAI(api_key=UCSD_API_KEY, base_url=UCSD_BASE_URL)
+SIMILARITY_THRESHOLD = 0.80  # difflib ratio: 0=nothing in common, 1=identical
 
 
-def llm_compare(existing_text: str, new_text: str) -> dict:
+def find_similar_note(user_id: str, text: str) -> tuple[dict | None, float]:
     """
-    Ask LLM to compare two notes and decide what to do.
-    Returns {"verdict": "duplicate"|"update"|"keep_both", "reason": str}
+    Compare new text against the user's recent notes using difflib.
+    Returns (most_similar_note_or_None, score).
+    Pure Python — no API call, no embedding.
     """
-    try:
-        resp = _llm.chat.completions.create(
-            model=LLM_CHAT_MODEL,
-            max_tokens=200,
-            messages=[{"role": "user", "content": (
-                "Compare these two notes and classify their relationship.\n\n"
-                f"Existing note: {existing_text}\n"
-                f"New note: {new_text}\n\n"
-                "Reply with exactly one of these verdicts and a short reason:\n"
-                "- 'duplicate' if they contain the same information (including typos/rephrasing)\n"
-                "- 'update' if the new note corrects or adds to the existing one\n"
-                "- 'keep_both' if they are meaningfully different\n\n"
-                "Format: <verdict>|<one sentence reason>"
-            )}]
-        )
-        raw = (resp.choices[0].message.content or "").strip()
-        parts = raw.split("|", 1)
-        verdict = parts[0].strip().lower()
-        reason = parts[1].strip() if len(parts) > 1 else ""
-        if verdict not in ("duplicate", "update", "keep_both"):
-            verdict = "keep_both"
-        return {"verdict": verdict, "reason": reason}
-    except Exception as e:
-        print(f"[ingestion.llm_compare] error: {e}")
-        return {"verdict": "keep_both", "reason": "Could not compare notes."}
-
-
-def find_similar_note(user_id: str, text: str) -> tuple[dict | None, list[float], bool]:
-    """
-    Returns (existing_note_or_None, embedding, skip_llm).
-    The embedding can be reused in ingest_text to avoid a second API call.
-    skip_llm=True means the match is near-identical; llm_compare can be bypassed.
-    """
-    matches, embedding = embedder.find_similar_for_save(user_id, text)
-    if not matches:
-        return None, embedding, False
-    notes = db.get_notes_by_ids([matches[0]["note_id"]])
-    existing = notes[0] if notes else None
-    return existing, embedding, matches[0].get("skip_llm", False)
+    recent = db.get_recent_notes(user_id, limit=20)
+    best_note, best_score = None, 0.0
+    for note in recent:
+        score = difflib.SequenceMatcher(
+            None, text.lower(), note["content_text"].lower()
+        ).ratio()
+        if score > best_score:
+            best_score = score
+            best_note = note
+    if best_score >= SIMILARITY_THRESHOLD:
+        return best_note, round(best_score, 4)
+    return None, 0.0
 
 
 async def ingest_image(user_id: str, image_url: str,
@@ -109,12 +83,7 @@ async def ingest_image(user_id: str, image_url: str,
 
 
 def ingest_text(user_id: str, text: str,
-                discord_message_id: str = None,
-                embedding: list[float] | None = None) -> Note:
-    """
-    Save a text note. Pass `embedding` to reuse a vector already computed
-    during find_similar_note, avoiding a redundant embedding API call.
-    """
+                discord_message_id: str = None) -> Note:
     note = Note(
         user_id=user_id,
         content_text=text,
@@ -123,8 +92,7 @@ def ingest_text(user_id: str, text: str,
         discord_message_id=discord_message_id
     )
     note.id = db.insert_note(note)
-    # Reuse the embedding if provided — skips a second round-trip
-    embedder.upsert(note.id, user_id, text, embedding=embedding)
+    embedder.upsert(note.id, user_id, text)
     return note
 
 

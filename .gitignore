@@ -59,6 +59,6 @@ Thumbs.db
 # Railway / deployment
 *.log
 
-# google credentials
+# google credentials 
 google_credentials.json
 google_tokens/

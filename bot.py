@@ -101,18 +101,13 @@ async def _send_query_response(channel, reply_func, thread_id: str, user_id: str
 
 # ── consolidation UI ──────────────────────────────────────────────────────────
 class ConsolidationView(discord.ui.View):
-    """
-    Shown when LLM detects a new note is similar to an existing one.
-    Verdict and reason from LLM are shown to help user decide.
-    """
+    """Shown when a new note is similar to an existing one (by embedding similarity)."""
     def __init__(self, user_id: str, new_text: str, existing_note: dict,
-                 verdict: str, reason: str, discord_message_id: str = None):
+                 discord_message_id: str = None):
         super().__init__(timeout=60)
         self.user_id = user_id
         self.new_text = new_text
         self.existing_note = existing_note
-        self.verdict = verdict
-        self.reason = reason
         self.discord_message_id = discord_message_id
 
     @discord.ui.button(label="Replace old note", style=discord.ButtonStyle.danger)
@@ -130,7 +125,7 @@ class ConsolidationView(discord.ui.View):
         self.stop()
         await interaction.response.edit_message(
             content=f"✅ Replaced Note {self.existing_note['id']} with Note {note.id}.",
-            embeds=[], view=None
+            embeds=[]
         )
 
     @discord.ui.button(label="Keep both", style=discord.ButtonStyle.success)
@@ -146,7 +141,7 @@ class ConsolidationView(discord.ui.View):
         self.stop()
         await interaction.response.edit_message(
             content=f"✅ Saved as Note {note.id}. Both notes kept.",
-            embeds=[], view=None
+            embeds=[]
         )
 
     @discord.ui.button(label="Discard new", style=discord.ButtonStyle.secondary)
@@ -156,7 +151,7 @@ class ConsolidationView(discord.ui.View):
             return
         self.stop()
         await interaction.response.edit_message(
-            content="❌ New note discarded. Existing note kept.", embeds=[], view=None
+            content="❌ New note discarded. Existing note kept."
         )
 
     async def on_timeout(self):
@@ -189,7 +184,7 @@ class SensitiveNoteView(discord.ui.View):
         db.update_note_sensitive(self.note_id, False)
         self.stop()
         await interaction.response.edit_message(
-            content=f"✅ Note {self.note_id} now **allowed into AI context**.", view=None
+            content=f"✅ Note {self.note_id} now **allowed into AI context**."
         )
 
     @discord.ui.button(label="Delete it", style=discord.ButtonStyle.danger)
@@ -201,7 +196,7 @@ class SensitiveNoteView(discord.ui.View):
         embedder.delete(self.note_id)
         self.stop()
         await interaction.response.edit_message(
-            content="🗑️ Sensitive note deleted — nothing stored.", view=None
+            content="🗑️ Sensitive note deleted — nothing stored."
         )
 
     async def on_timeout(self):
@@ -216,37 +211,17 @@ async def _save_with_consolidation_check(
     discord_message_id: str = None,
     original_message: discord.Message = None,
 ):
-    # Single embedding round-trip: returns (existing_note | None, embedding, skip_llm)
-    # The embedding is reused by ingest_text so we never call the embedding API twice.
-    existing, embedding, skip_llm = await asyncio.to_thread(
-        ingestion.find_similar_note, user_id, text
-    )
+    existing, score = ingestion.find_similar_note(user_id, text)
 
     if existing:
-        if skip_llm:
-            # Near-identical (>= SKIP_LLM_THRESHOLD) — treat as duplicate without an LLM call
-            verdict, reason = "duplicate", "Notes are nearly identical."
-        else:
-            # In the 0.80–0.97 band — worth asking the LLM
-            comparison = await asyncio.to_thread(
-                ingestion.llm_compare, existing["content_text"], text
-            )
-            verdict = comparison["verdict"]
-            reason = comparison["reason"]
-
-        verdict_label = {
-            "duplicate": "🔁 Duplicate",
-            "update":    "🔄 Update to existing",
-            "keep_both": "📝 Possibly different",
-        }.get(verdict, "⚠️ Similar note found")
-
+        pct = round(score * 100)
         view = ConsolidationView(
-            user_id, text, existing, verdict, reason,
+            user_id, text, existing,
             discord_message_id=discord_message_id
         )
         await send_func(
             content=(
-                f"{verdict_label} — *{reason}*\n\n"
+                f"⚠️ Similar note found ({pct}% match) — what would you like to do?\n\n"
                 "**Existing note** (above) vs **New note** (below):"
             ),
             embeds=[
@@ -257,9 +232,8 @@ async def _save_with_consolidation_check(
         )
         return
 
-    # Reuse the embedding computed above — ingest_text won't call the API again
     note = await asyncio.to_thread(
-        ingestion.ingest_text, user_id, text, discord_message_id, embedding
+        ingestion.ingest_text, user_id, text, discord_message_id
     )
 
     if note.is_sensitive:
@@ -275,7 +249,7 @@ async def _save_with_consolidation_check(
         if original_message:
             await original_message.add_reaction("✅")
         else:
-            await send_func(content="✅ Saved.", embeds=[], view=None)
+            await send_func(content="✅ Saved.")
 
 
 # ── events ────────────────────────────────────────────────────────────────────
@@ -291,8 +265,9 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    await bot.process_commands(message)
+    # Prefix commands (e.g. !clear): hand off and stop — don't fall into NLP path
     if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
         return
 
     uid = _user_id(message)
@@ -341,8 +316,8 @@ async def on_message(message: discord.Message):
         intent = await asyncio.to_thread(_classify, text)
 
     if intent == "save":
-        async def _send(content, embeds, view):
-            await message.reply(content=content, embeds=embeds, view=view)
+        async def _send(content, embeds=None, view=None):
+            await message.reply(content=content, **({'embeds': embeds} if embeds else {}), **({'view': view} if view else {}))
         await _save_with_consolidation_check(
             _send, uid, text,
             discord_message_id=str(message.id),
@@ -400,10 +375,14 @@ async def slash_save(interaction: discord.Interaction, note: str):
     await interaction.response.defer(ephemeral=True)
     uid = str(interaction.user.id)
 
-    async def _send(content, embeds, view):
-        await interaction.followup.send(content=content, embeds=embeds, view=view, ephemeral=True)
+    async def _send(content, embeds=None, view=None):
+        await interaction.followup.send(content=content, ephemeral=True, **({'embeds': embeds} if embeds else {}), **({'view': view} if view else {}))
 
-    await _save_with_consolidation_check(_send, uid, note)
+    try:
+        await _save_with_consolidation_check(_send, uid, note)
+    except Exception as e:
+        print(f"[slash_save] error: {e}")
+        await interaction.followup.send("❌ Something went wrong while saving.", ephemeral=True)
 
 
 @tree.command(name="ask", description="Ask a question about your saved notes")
@@ -412,20 +391,23 @@ async def slash_ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
     uid = str(interaction.user.id)
     tid = str(interaction.channel_id)
-    # FIX: conversation.answer() is fully synchronous — run in thread
-    reply_text, safe_notes, sensitive_notes = await asyncio.to_thread(
-        conversation.answer, tid, uid, question
-    )
-    await interaction.followup.send(reply_text)
-    for n in safe_notes[:3]:
-        await interaction.followup.send(embed=_make_embed(n))
-    if sensitive_notes:
-        await interaction.followup.send(
-            "⚠️ Some notes with sensitive content were not shown to the AI:",
-            ephemeral=True
+    try:
+        reply_text, safe_notes, sensitive_notes = await asyncio.to_thread(
+            conversation.answer, tid, uid, question
         )
-        for n in sensitive_notes:
-            await interaction.followup.send(embed=_make_embed(n), ephemeral=True)
+        await interaction.followup.send(reply_text)
+        for n in safe_notes[:3]:
+            await interaction.followup.send(embed=_make_embed(n))
+        if sensitive_notes:
+            await interaction.followup.send(
+                "⚠️ Some notes with sensitive content were not shown to the AI:",
+                ephemeral=True
+            )
+            for n in sensitive_notes:
+                await interaction.followup.send(embed=_make_embed(n), ephemeral=True)
+    except Exception as e:
+        print(f"[slash_ask] error: {e}")
+        await interaction.followup.send("❌ Something went wrong while answering.")
 
 
 @tree.command(name="list", description="Show your most recent saved notes")
