@@ -61,3 +61,4 @@ Thumbs.db
 
 # google credentials
 google_credentials.json
+google_tokens/
