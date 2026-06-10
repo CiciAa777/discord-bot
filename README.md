@@ -201,3 +201,17 @@ Next, open discord server and talk to Otter.
 - a classification model for input state
 - guardrail for hello xxx
 - let user update
+
+To dos: 
+1. neutral input mode- add slash commands(/save, /ask); also use a small LLM to classify non slash commands - bot.py (done)
+2. sensitive info guarrail- flag possible sensitive info, ask user to confirm; - conversation.py
+if sensitive but still want to be saved, then make sure during rag, direct retrieval, no LLM part (done, if >=12 gibberish, would pop up the sensitive notification)
+3. note management- if detects repeated notes, let LLM decide, then prompt to user to confirm if update; also let user delete -db.py, ingestion.py, embedder.py (done)
+4. allow the update/delete message button on discord work in sync with the storage system (done)
+4. Google Calendar (to do)
+5. Live Deployment (to do)
+
+What I'd add next, in priority order:
+Rate limiting per user — right now one user hammering saves would burn your API quota for everyone. A simple in-memory counter per user_id per minute is enough.
+better/smarter memory management
+multiple channels, different functionalities

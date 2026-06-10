@@ -12,3 +12,5 @@ class Note:
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     id: Optional[int] = None  # set after DB insert
     ocr_failed: bool = False
+    is_sensitive: bool = False
+    discord_message_id: Optional[str] = None

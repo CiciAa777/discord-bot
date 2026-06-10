@@ -2,10 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+ 
 # C extensions
 *.so
-
+ 
 # Distribution / packaging
 .Python
 build/
@@ -25,25 +25,22 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+ 
 # Virtual Environments
 .venv/
 venv/
 ENV/
 env/
 ActiveState.venv/
-
-# Environment / Secrets (Crucial to prevent uploading API keys!)
+ 
+# Environment / Secrets
 .env
-replace.txt
-
+ 
 # SnapVault Local Databases & Media Uploads
 snapvault.db
-snapvault.db-journal
 chroma_db/
-chromadb/
 uploads/
-
+ 
 # OS-specific files
 .DS_Store
 .DS_Store?
@@ -52,10 +49,12 @@ uploads/
 .Trashes
 ehthumbs.db
 Thumbs.db
-
+ 
 # IDEs and Editors
 .vscode/
 .idea/
 *.swp
 *.swo
-__pycache__/
+ 
+# Railway / deployment
+*.log
